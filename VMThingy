@@ -1,0 +1,530 @@
+#!/bin/bash
+
+##
+## VM Thingy -- By Clint Theriault
+##
+
+#
+# This script will detect your Windows VM and try to connect to it using RDP
+# The goal is for it to work with VMWare and VirtualBox, but for now it just
+# works with virsh/Virt Manager
+#
+# This program was coded 80% by ChatGPT, but I've carefully inspected every line
+# and made sure it's not doing anything weird.
+#
+
+######
+## Global Variables Go Here
+######
+VMUSER=$USER
+
+VMMode=""
+USE_FLATPAK=true
+
+REQUIRED_PROGRAMS=(
+  zenity
+  awk
+  grep
+  tail
+)
+
+
+REQUIRED_KVM_PROGRAMS=(
+  qemu-system-x86_64
+  virsh
+  virtqemud
+)
+
+######
+## End of varible section
+######
+
+######
+## Functions Go Here
+######
+
+## looks for $1 in $PATH, returns result
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+## checks if $1 is installed as a flatpak (uses flathub id)
+flatpak_app_exists() {
+  flatpak info "$1" >/dev/null 2>&1
+}
+
+## Generic Error function
+gui_error() {
+  local title="Application Error"
+  local msg="$1"
+
+  # Prefer GUI if available
+  if command -v zenity >/dev/null 2>&1 && [[ -n "$DISPLAY" ]]; then
+    zenity --error \
+      --title="$title" \
+      --text="$msg"
+  else
+    echo "ERROR: $title" >&2
+    echo "$msg" >&2
+  fi
+}
+
+## checks for required apps and displays an error if not found
+required_cmd() {
+  local missing=()
+  local cmd
+
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    gui_error "Missing dependencies:
+
+${missing[*]}
+
+Please install them and try again."
+    return 1
+  fi
+}
+
+## asks to install a given list of flathub apps. Then installs them. Returns true if successful
+install_flatpak_apps() {
+  local apps=("$@")
+  local app_list
+  app_list=$(printf "• %s\n" "${apps[@]}")
+
+  command -v flatpak >/dev/null 2>&1 || {
+    gui_error "Flatpak is not installed.
+
+Please install Flatpak and try again."
+    return 1
+  }
+
+  # Ask for confirmation
+  if command -v zenity >/dev/null 2>&1 && [[ -n "$DISPLAY" ]]; then
+    zenity --question \
+      --title="Install Applications" \
+      --text="The following applications will be installed:\n\n$app_list\nContinue?" \
+      --width=400 || return 1
+  else
+    echo "Installing:"
+    echo "$app_list"
+    read -rp "Continue? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || return 1
+  fi
+
+  # Ensure Flathub exists
+  if ! flatpak remote-list | grep -q '^flathub'; then
+    flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || {
+      gui_error "Failed to add the Flathub repository."
+      return 1
+    }
+  fi
+
+  # GUI progress install
+  if command -v zenity >/dev/null 2>&1 && [[ -n "$DISPLAY" ]]; then
+    (
+      echo "# Starting installation..."
+      flatpak install -y flathub "${apps[@]}" 2>&1 | while read -r line; do
+        # Update dialog text with flatpak output
+        echo "# $line"
+      done
+    ) | zenity --progress \
+        --title="Installing Applications" \
+        --text="Preparing…" \
+        --pulsate \
+        --auto-close \
+        --auto-kill
+
+    [[ ${PIPESTATUS[1]} -eq 0 ]] || {
+      gui_error "One or more applications failed to install."
+      return 1
+    }
+  else
+    # Terminal fallback
+    flatpak install -y flathub "${apps[@]}" || return 1
+  fi
+
+  return 0
+}
+
+#search for saved VMWare VMs
+get_vmware_vms() {
+    ALL_VMS=()
+    ALL_URIS=()
+    ALL_STATES=()
+    ALL_OS_IDS=()
+
+    # Common VMware VM locations
+    local search_paths=(
+        "$HOME/vmware"
+        "$HOME/VMware"
+        "/var/lib/vmware/Virtual Machines"
+    )
+
+    local vmx_files=()
+
+    # Find .vmx files
+    for path in "${search_paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            while IFS= read -r -d '' file; do
+                vmx_files+=("$file")
+            done < <(find "$path" -type f -name "*.vmx" -print0 2>/dev/null)
+        fi
+    done
+
+    # Parse each VMX file
+    for vmx in "${vmx_files[@]}"; do
+        local guestOS
+        guestOS=$(grep -i '^guestOS' "$vmx" | cut -d'"' -f2)
+
+        # Only include Windows VMs
+        if [[ "$guestOS" =~ [Ww]indows ]]; then
+            local vm_name
+            vm_name=$(basename "$vmx" .vmx)
+
+            # Determine running state
+            if vmrun list | grep -q "$vmx"; then
+                state="running"
+            else
+                state="stopped"
+            fi
+
+            ALL_VMS+=("$vm_name")
+            ALL_URIS+=("$vmx")
+            ALL_STATES+=("$state")
+            ALL_OS_IDS+=("$guestOS")
+        fi
+    done
+
+    if (( ${#ALL_VMS[@]} == 0 )); then
+        gui_error "No Windows VMware VMs found."
+        return 1
+    fi
+
+    return 0
+}
+
+
+# This funtion checks your local system for VMs running Windows using KVM
+get_kvm_vms() {
+    ALL_VMS=()
+    ALL_URIS=()
+    ALL_STATES=()
+    ALL_OS_IDS=()
+
+    local uris=("qemu:///system" "qemu:///session")
+    local connected=false
+    local output
+
+    for uri in "${uris[@]}"; do
+        if output=$(virsh --connect "$uri" list --all 2>/dev/null); then
+            connected=true
+
+            # Skip header lines
+            while read -r id name state_rest; do
+                [[ "$name" == "Name" || -z "$name" ]] && continue
+
+                # Reconstruct full state (handles "shut off")
+                state=$(awk '{$1=""; $2=""; sub(/^  */,""); print}' <<< "$id $name $state_rest")
+
+                # Extract OS metadata
+                os_id=$(virsh --connect "$uri" dumpxml "$name" 2>/dev/null \
+                    | grep -oP '(?<=libosinfo:os id=")[^"]+')
+
+                # Only include Windows VMs
+                if [[ "$os_id" =~ microsoft ]]; then
+                    ALL_VMS+=("$name")
+                    ALL_URIS+=("$uri")
+                    ALL_STATES+=("$state")
+                    ALL_OS_IDS+=("$os_id")
+                fi
+
+            done <<< "$(tail -n +3 <<< "$output")"
+        fi
+    done
+
+    if ! $connected; then
+        gui_error "Error: Unable to connect to libvirt (system or session)." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+#list VMs in the list, and return which one the user wants
+select_windows_vm() {
+    local choice
+    local zen_rows=()
+
+    # No VMs available
+    if (( ${#ALL_VMS[@]} == 0 )); then
+        gui_error "No Windows VMs found!
+...Starting Virt-Manager so you can create one..."
+        return 1
+    fi
+
+    # If there's only one, just use that
+    if (( ${#ALL_VMS[@]} == 1 )); then
+      SELECTED_VM_INDEX="0"
+      return 0
+    fi
+
+    # Build row data: index, name, state
+    for i in "${!ALL_VMS[@]}"; do
+        zen_rows+=("$i" "${ALL_VMS[$i]}" "${ALL_STATES[$i]}")
+    done
+
+    choice=$(zenity --list \
+        --title="Select Windows VM" \
+        --width=500 \
+        --height=400 \
+        --column="Index" \
+        --column="VM Name" \
+        --column="State" \
+        --hide-column=1 \
+        --print-column=1 \
+        "${zen_rows[@]}")
+
+    # User cancelled
+    if [[ -z "$choice" ]]; then
+        return 1
+    fi
+
+    # Return selected index
+    SELECTED_VM_INDEX="$choice"
+    return 0
+}
+
+#get the VM's IP Address and try and wait for it to become ready
+wait_for_vm_ready() {
+    local vm_name="$1"
+    local uri="$2"
+    local timeout=180
+    local interval=2
+    local elapsed=0
+    local ip=""
+    local last_ip=""
+
+    # Detect whether nc is available
+    if command -v nc >/dev/null 2>&1; then
+        check_rdp() {
+            timeout 1 nc -z "$1" 3389 2>/dev/null
+        }
+    else
+        check_rdp() {
+            timeout 1 bash -c "echo > /dev/tcp/$1/3389" 2>/dev/null
+        }
+    fi
+
+    # Subshell runs the loop; writes status + IP to temp files
+    (
+        echo "0"
+        echo "# VM booting up..."
+
+        while (( elapsed < timeout )); do
+
+            state=$(virsh --connect "$uri" domstate "$vm_name" 2>/dev/null)
+
+            if [[ "$state" == "running" ]]; then
+
+#                ip=$(virsh --connect "$uri" domifaddr "$vm_name" 2>/dev/null \
+#                     | awk '/ipv4/ {print $4}' | cut -d'/' -f1)
+
+              if [ "$VMMode" == "KVM" ]; then
+                  ip=$(virsh --connect "$uri" domifaddr "$vm_name" 2>/dev/null \
+                      | awk '/ipv4/ {print $4}' | cut -d'/' -f1)
+
+              elif [ "$VMMode" == "VMWARE" ]; then
+                  ip=$(vmrun getGuestIPAddress "$uri" -wait 2>/dev/null)
+              fi
+
+              if [[ -n "$ip" ]]; then
+                  last_ip="$ip"
+                  echo "# IP is: $ip Connecting..."
+
+                  if check_rdp "$ip"; then
+                      echo "$ip" > /tmp/vm_ready_ip.$$
+                      echo "0" > /tmp/vm_ready_status.$$
+                      echo "100"
+                      echo "# CONNECTED!"
+                      exit 0
+                  fi
+              else
+                echo "# VM running. Waiting for IP..."
+              fi
+            fi
+
+            sleep "$interval"
+            ((elapsed+=interval))
+            percent=$(( elapsed * 100 / timeout ))
+            echo "$percent"
+        done
+
+        # Timeout reached
+        if [[ -n "$last_ip" ]]; then
+            echo "$last_ip" > /tmp/vm_ready_ip.$$
+            echo "0" > /tmp/vm_ready_status.$$
+            echo "100"
+            echo "# Timeout reached, but IP was detected. Proceeding anyway..."
+            exit 0
+        fi
+
+        # Hard failure
+        echo "1" > /tmp/vm_ready_status.$$
+        exit 1
+
+    ) | zenity --progress \
+        --title="Connecting to $vm_name" \
+        --text="Waiting for bootup..." \
+        --percentage=0 \
+        --auto-close \
+        --auto-kill \
+        --cancel-label="Cancel"
+
+    zenity_exit=$?
+
+    # Read subshell status
+    if [[ -f /tmp/vm_ready_status.$$ ]]; then
+        subshell_status=$(cat /tmp/vm_ready_status.$$)
+        rm -f /tmp/vm_ready_status.$$
+    else
+        subshell_status=1
+    fi
+
+    # Handle cancellation
+    if [[ $zenity_exit -eq -1 ]]; then
+        zenity --warning --text="Operation cancelled."
+        return 1
+    fi
+
+    # Success path
+    if [[ $subshell_status -eq 0 && -f /tmp/vm_ready_ip.$$ ]]; then
+        VM_READY_IP=$(cat /tmp/vm_ready_ip.$$)
+        rm -f /tmp/vm_ready_ip.$$
+        return 0
+    fi
+
+    # Failure path
+    zenity --error --text="VM did not become ready in time."
+    return 1
+}
+
+
+######
+## End of Function section
+######
+
+######
+## Start of Main function
+######
+
+# Detect VMware Workstation
+if command_exists vmrun; then
+    VMMode="VMWARE"
+else
+    VMMode="KVM"
+fi
+
+
+#Pull the installed VMs
+if [ "$VMMode" == "VMWARE" ]; then
+    REQUIRED_PROGRAMS+=(vmrun)
+    get_vmware_vms
+
+elif [ "$VMMode" == "KVM" ]; then
+    REQUIRED_PROGRAMS+=("${REQUIRED_KVM_PROGRAMS[@]}")
+    get_kvm_vms
+
+  #also check for required KVM programs
+  if command_exists virt-manager &&
+     command_exists krdc
+  then
+    USE_FLATPAK=false
+  fi
+elif command_exists krdc
+then
+    USE_FLATPAK=false
+fi
+
+# checks if flatpak is needed
+$USE_FLATPAK && REQUIRED_PROGRAMS+=(flatpak)
+
+# check for required programs
+required_cmd "${REQUIRED_PROGRAMS[@]}" || exit 1
+
+# check for required flathub apps if local versions aren't availible
+if $USE_FLATPAK;
+then
+  FLATHUB_APPS=()
+
+  #if KVM then check for virtmanager
+  CurrentApp="org.virt_manager.virt-manager"
+  if [[ "$VMMode" == "KVM" ]] &&
+    ! command_exists virt-manager &&
+    ! flatpak_app_exists "$CurrentApp"
+  then
+    FLATHUB_APPS+=("$CurrentApp")
+  fi
+
+  #only krdc is supported for now. Might add a fallback to xFreeRDP or something later
+  CurrentApp="org.kde.krdc"
+  if ! command_exists krdc &&
+     ! flatpak_app_exists "$CurrentApp"
+  then
+    FLATHUB_APPS+=("$CurrentApp")
+  fi
+
+  #try to install missing apps
+  if [ -n "$FLATHUB_APPS" ];
+  then
+    install_flatpak_apps "${FLATHUB_APPS[@]}" || exit 1
+  fi
+fi
+
+#display a list of VMs to choose from if there are more than one.
+if select_windows_vm; then
+  i="$SELECTED_VM_INDEX"
+
+  #if the state is not running, Start the VM
+  if ! [[ "${ALL_STATES[$i]}" =~ "unning" ]]; then
+
+      if [ "$VMMode" == "KVM" ]; then
+          virsh -c ${ALL_URIS[$i]} start ${ALL_VMS[$i]} 2>/dev/null
+          virsh -c ${ALL_URIS[$i]} dompmwakeup ${ALL_VMS[$i]} 2>/dev/null
+
+      elif [ "$VMMode" == "VMWARE" ]; then
+          vmrun start "${ALL_URIS[$i]}" nogui 2>/dev/null
+      fi
+  fi
+
+#if no VMs detected, start virtmanager so user can make one
+elif (( ${#ALL_VMS[@]} == 0 )); then
+  if $USE_FLATPAK
+  then
+    flatpak run org.virt_manager.virt-manager
+  else
+    virt-manager
+  fi
+
+#assume user canceled and quit program
+else
+  exit
+fi
+
+#if a VM was selected and started, then wait for
+if [ -n $SELECTED_VM_INDEX ]; then
+
+  #wait for VM to become ready then connect to ip using krdc
+  if wait_for_vm_ready "${ALL_VMS[$i]}" "${ALL_URIS[$i]}"; then
+
+      echo "Connecting to $VM_READY_IP"
+      if $USE_FLATPAK; then
+        flatpak run org.kde.krdc "rdp://$VMUSER@$VM_READY_IP" 2>/dev/null
+      else
+        krdc "rdp://$VMUSER@$VM_READY_IP" 2>/dev/null
+      fi
+  fi
+fi
+
