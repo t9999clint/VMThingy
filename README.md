@@ -16,6 +16,11 @@ In theory this script should work with any distro, but I've only tested it with 
 There's some other features I'd like to add, like LookingGlass support, and support for RemoteApps (Like WinBoat).
 Once all of that is done I might add other VM scripts, (setting up PCI passthrough, downloading/patching Windows ISOs, etc
 
+--------------
+**How to Install:**
+
+Download the VMThingy file and set it as executable. (chmod +x)
+Then just doubleclick it to run it.
 
 --------------
 **AI Disclaimer:**
