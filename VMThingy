@@ -491,8 +491,8 @@ if select_windows_vm; then
   if ! [[ "${ALL_STATES[$i]}" =~ "unning" ]]; then
 
       if [ "$VMMode" == "KVM" ]; then
-          virsh -c ${ALL_URIS[$i]} start ${ALL_VMS[$i]} 2>/dev/null
-          virsh -c ${ALL_URIS[$i]} dompmwakeup ${ALL_VMS[$i]} 2>/dev/null
+          virsh -c "${ALL_URIS[$i]}" start "${ALL_VMS[$i]}" 2>/dev/null
+          virsh -c "${ALL_URIS[$i]}" dompmwakeup "${ALL_VMS[$i]}" 2>/dev/null
 
       elif [ "$VMMode" == "VMWARE" ]; then
           vmrun start "${ALL_URIS[$i]}" nogui 2>/dev/null
@@ -514,7 +514,7 @@ else
 fi
 
 #if a VM was selected and started, then wait for
-if [ -n $SELECTED_VM_INDEX ]; then
+if [ -n "$SELECTED_VM_INDEX" ]; then
 
   #wait for VM to become ready then connect to ip using krdc
   if wait_for_vm_ready "${ALL_VMS[$i]}" "${ALL_URIS[$i]}"; then
@@ -527,4 +527,3 @@ if [ -n $SELECTED_VM_INDEX ]; then
       fi
   fi
 fi
-
