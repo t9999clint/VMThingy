@@ -1,6 +1,15 @@
 # Script Thingies
 There are seveeral scripts planned for this project. At the moment only two are shared here, VMThingy and SMPT.
 
+Planned scripts
+
+- **StateThingy**: Script system for runing other scripts depending on the state of your PC. (Locked, Unlocked, Active Network device, Current Subnet, etc). Only Locked/Unlocked is finished right now.
+- **InstallThingy**: Give it an installer file (any OS) and it'll install it for you. Otherwise it will act as a installer meta search engine. (update parts are just using the ujust update thing)
+- **RetroThingy**: Give it a rom/iso/exe file and it'll install/configure/start the appropriate emulator. Otherwise it lists a bunch of consoles, then you tell it what to open. (99% of it is just RetroArch and MAME)
+- **VideoThingy**: GUI for transcoding/capturing video using ffmpeg. Has lowlatency video preview mode.
+- **FlatThingy**: Flathub CLI wrapper tool to make flathub cli commands easier.
+- **GameThingy**: Gamescope/LSFG/GOverlay wrapper frontend tool for launching games with any combination of those tools. Will remember settings for each Game (Easy CRT Filters and such). Goal for this one is to be a mostly feature complete, Linux equivalent to Lossless scaling.
+
 --------------
 **SMPT - The Simple Multi Package Tool**
 
