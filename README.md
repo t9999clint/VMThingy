@@ -1,6 +1,7 @@
 # Script Thingies
 There are seveeral scripts planned for this project. At the moment only two are shared here, VMThingy and SMPT.
 
+--------------
 **SMPT - The Simple Multi Package Tool**
 
 Pronounced Simped, SMPT is used to install packages using whatever package manager it can find.
@@ -12,8 +13,8 @@ Each package source is configurable through the config file at ~/.config/smpt/co
 To install, just download the smpt.py file, and run `python ./smpt.py deploy`
 You can also just use it as it is without installing it by marking it as executable and calling it directly.
 
+--------------
 **VMThingy - The simple Windows VM starting tool for Linux.**
-
 
 This tool is meant to make it easy to start a Windows VM and connect to it through RDP.
 
@@ -32,12 +33,12 @@ Once all of that is done I might add other VM scripts, (setting up PCI passthrou
 --------------
 **How to Install:**
 
-Download the VMThingy file and set it as executable. (chmod +x)
+Download the script thingy file you want to use and set it as executable. (chmod +x)
 Then just doubleclick it to run it.
 
 --------------
 **AI Disclaimer:**
 
-This program is about 80% written by ChatGPT, but every line was inspected and tested before being added to the repo. If I don't understand what it's doing, then it's not getting added.
+These scripts are about 80% written by ChatGPT and claude, but every line was inspected and tested before being added to the repo. If I don't understand what it's doing, then it's not getting added.
 
 I see AI as a tool for coding faster by getting letting it do the grunt work. It is NOT capible of writing code on it's own. I usually only give it a function to write at a time. This helps keep it's halucinations down to a minimum.
