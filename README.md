@@ -1,5 +1,18 @@
-# VMThingy
-**The simple Windows VM starting tool for Linux.**
+# Script Thingies
+There are seveeral scripts planned for this project. At the moment only two are shared here, VMThingy and SMPT.
+
+**SMPT - The Simple Multi Package Tool**
+
+Pronounced Simped, SMPT is used to install packages using whatever package manager it can find.
+Basically it's a search tool that will look up the request on all your package sources at once and spit it out into a list for you to choose from.
+Currently supports flatpak, appman, brew, cargo, apt, dnf, pacman and rpm-ostree.
+
+Each package source is configurable through the config file at ~/.config/smpt/config.ini (will first check it's own directory for a config.ini to allow for portable use)
+
+To install, just download the smpt.py file, and run `python ./smpt.py deploy`
+You can also just use it as it is without installing it by marking it as executable and calling it directly.
+
+**VMThingy - The simple Windows VM starting tool for Linux.**
 
 
 This tool is meant to make it easy to start a Windows VM and connect to it through RDP.
