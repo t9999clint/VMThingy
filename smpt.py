@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 smpt - Simple Multi-Package Tool
-Discovery prototype: 'smpt search <package>' only.
+A unified frontend for multiple package managers.
 """
 
 import sys
@@ -17,7 +17,7 @@ import time
 import tempfile
 import hashlib
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -98,9 +98,6 @@ class ResolvedPackage:
     pkg:     MergedResult  # the chosen result
     backend: str           # the chosen backend to install from
 
-    def pkg_id(self) -> str:
-        return self.pkg.pkg_id(self.backend)
-
     def install_id(self) -> str:
         """The identifier to pass to the install command for this backend."""
         return self.pkg.pkg_id(self.backend)
@@ -158,6 +155,14 @@ color = true
 # query string. Set to false to see all results (including description matches).
 name_filter = true
 
+# Cache settings
+# `cache_ttl_seconds` controls how long (in seconds) cached search results
+# are considered valid. Set to 0 to disable caching.
+cache_ttl_seconds = 86400
+# `cache_dir` can be used to override the default cache directory. Leave
+# empty to use the system temp directory.
+cache_dir = 
+
 # ---------------------------------------------------------------------------
 # Backend sections
 # Each backend has three settings:
@@ -173,12 +178,12 @@ warn_on_install = false
 
 [brew]
 enabled = true
-priority = 20
+priority = 30
 warn_on_install = false
 
 [cargo]
 enabled = true
-priority = 30
+priority = 35
 warn_on_install = false
 
 [apt]
@@ -256,8 +261,8 @@ def load_config() -> configparser.ConfigParser:
 _DEFAULT_PRIORITY = {
     "flatpak":    10,
     "appman":     25,
-    "brew":       20,
-    "cargo":      30,
+    "brew":       30,
+    "cargo":      35,
     "conda":      35,
     "apt":        40,
     "dnf":        40,
@@ -303,7 +308,6 @@ def get_enabled_backends(config: configparser.ConfigParser) -> list[str]:
 
 def command_exists(cmd: str) -> bool:
     """Return True if `cmd` is on PATH."""
-    import shutil
     return shutil.which(cmd) is not None
 
 
@@ -355,10 +359,18 @@ def _parse_flatpak_lines(lines: list[str], query: str = "") -> list[PackageResul
     Uses the last segment of the application ID as the package name
     (e.g. "org.virt_manager.virt-manager" -> "virt-manager") so that
     flatpak results deduplicate correctly against other backends.
+    
+    When multiple apps have the same final segment (e.g. "player"),
+    uses the second-to-last segment instead (e.g. "easyrpg" vs "ecotubehq")
+    to avoid collisions while still allowing deduplication across other backends.
+    
     The human-readable display name is prepended to the description so
     it remains visible in the results table.
     """
-    results = []
+    # First pass: parse all entries and detect name collisions
+    parsed_entries = []
+    final_segments = {}  # segment -> list of app_ids with this segment
+    
     q = query.lower()
     for line in lines:
         parts = line.split("\t")
@@ -372,8 +384,32 @@ def _parse_flatpak_lines(lines: list[str], query: str = "") -> list[PackageResul
         if not app_id or display_name.lower() == "name":
             continue  # skip empty / header rows
 
-        # Use the last segment of the app ID as the canonical package name
-        pkg_name = app_id.rsplit(".", 1)[-1]
+        parsed_entries.append((display_name, app_id, version, desc))
+        
+        # Track which app_ids have the same final segment
+        final = app_id.rsplit(".", 1)[-1]
+        if final not in final_segments:
+            final_segments[final] = []
+        final_segments[final].append(app_id)
+    
+    # Determine which final segments have collisions
+    collision_segments = {seg for seg, ids in final_segments.items() if len(ids) > 1}
+    
+    # Second pass: build PackageResults with appropriate names
+    results = []
+    for display_name, app_id, version, desc in parsed_entries:
+        # Determine the package name: use second-to-last segment if there's a collision
+        app_id_parts = app_id.rsplit(".", 1)
+        final = app_id_parts[-1]
+        
+        if final in collision_segments:
+            # Use second-to-last segment to disambiguate
+            if len(app_id_parts) > 1:
+                pkg_name = app_id_parts[0].rsplit(".", 1)[-1]
+            else:
+                pkg_name = final  # fallback if only one segment
+        else:
+            pkg_name = final
 
         # Combine display name + description so neither is lost
         full_desc = f"{display_name}: {desc}" if desc else display_name
@@ -532,8 +568,7 @@ def search_rpm_ostree(query: str) -> list[PackageResult]:
         return []
 
     results = []
-    lines = stdout.strip().splitlines()
-    for line in lines:
+    for line in stdout.strip().splitlines():
         line = line.strip()
         # Skip section headers and empty lines
         if line.startswith("=====") or not line:
@@ -597,11 +632,12 @@ def installed_dnf(query: str) -> list[PackageResult]:
 
 
 def installed_rpm_ostree(query: str) -> list[PackageResult]:
-    # Layered packages show up in rpm -qa just like regular dnf installs
-    results = installed_dnf(query)
-    for r in results:
-        r.backend = "rpm-ostree"
-    return results
+    # Layered packages show up in rpm -qa just like regular dnf installs.
+    # Build new PackageResult objects rather than mutating the dnf results.
+    return [
+        PackageResult(r.name, r.version, r.description, "rpm-ostree", r.app_id)
+        for r in installed_dnf(query)
+    ]
 
 
 def installed_pacman(query: str) -> list[PackageResult]:
@@ -701,8 +737,6 @@ def search_conda(query: str) -> list[PackageResult]:
     Uses wildcards around query for better results.
     JSON format is easier to parse than tabular output.
     """
-    import json
-    
     # Add wildcards for better search results as suggested in conda docs
     search_query = f"*{query}*"
     # Conda search can be slow, use longer timeout
@@ -716,15 +750,14 @@ def search_conda(query: str) -> list[PackageResult]:
     except json.JSONDecodeError:
         return []
 
+    def version_key(v: dict) -> list[int]:
+        """Sort key for version strings — compares numeric segments only."""
+        return [int(x) for x in v["version"].split('.') if x.isdigit()]
+
     results = []
     # The JSON structure is {package_name: [versions...]}
     for pkg_name, versions in data.items():
         if versions:
-            # Get the latest version by sorting version strings
-            # Use a simple version comparison that works for most cases
-            def version_key(v):
-                return [int(x) for x in v["version"].split('.') if x.isdigit()]
-            
             latest = max(versions, key=version_key)
             version = latest.get("version", "")
             results.append(PackageResult(pkg_name, version, "", "conda"))
@@ -807,8 +840,6 @@ def installed_conda(query: str) -> list[PackageResult]:
     Parse `conda list --json` output to find installed packages.
     JSON format is easier to parse than tabular output.
     """
-    import json
-    
     stdout, _, rc = run(["conda", "list", "--json"], timeout=30)
     if rc != 0 or not stdout.strip():
         return []
@@ -880,11 +911,6 @@ def merge_results(
     Deduplicate by package name (case-insensitive).
     The first occurrence (highest-priority backend) provides version/description.
     Subsequent occurrences just add their backend to the list.
-    """
-    """
-    Deduplicate by package name (case-insensitive).
-    The first occurrence (highest-priority backend) provides version/description.
-    Subsequent occurrences just add their backend to the list.
 
     If name_filter is True, only packages whose name contains the query
     string are kept. Description-only matches are dropped to keep results focused.
@@ -926,67 +952,94 @@ def merge_results(
 CACHE_TTL_SECONDS = 24 * 3600
 CACHE_DIR = Path(tempfile.gettempdir()) / "smpt_search_cache"
 
+# Concurrency and timeout tuning
+BACKEND_SEARCH_TIMEOUT_SECONDS = 30
+BACKEND_MAX_WORKERS = 8
 
-def _search_cache_key(query: str, config_path: Path, script_path: Path) -> str:
+# Computed once per run — config and script path don't change mid-session
+_CACHE_STATIC_PATH = Path(__file__).resolve()
+
+
+def _cache_file_for(query: str, backends: list[str]) -> Path:
+    """Return the cache file path for a given query and backend set.
+
+    The hash includes the query, the sorted backend list, and the current
+    PATH environment so that changes to available backends or install
+    locations invalidate the cache. The actual cache directory may be
+    overridden in the user's config under [smpt].
+    """
+    cfg_path, _ = find_config_path()
+    # Allow user to override cache directory via config
+    try:
+        config = load_config()
+        configured_dir = config.get("smpt", "cache_dir", fallback="").strip()
+    except Exception:
+        configured_dir = ""
+
+    base_dir = Path(os.path.expanduser(configured_dir)) if configured_dir else CACHE_DIR
     h = hashlib.sha256()
     h.update(query.encode("utf-8"))
-
-    for path in (config_path, script_path):
+    backend_key = ",".join(sorted(backends)) if backends else ""
+    h.update(backend_key.encode("utf-8"))
+    h.update(os.environ.get("PATH", "").encode("utf-8"))
+    for path in (cfg_path, _CACHE_STATIC_PATH):
         try:
-            h.update(path.read_bytes())
+            h.update(str(path.stat().st_mtime).encode("utf-8"))
+            h.update(str(path).encode("utf-8"))
         except OSError:
             h.update(str(path).encode("utf-8"))
-
-    return h.hexdigest()
-
-
-def _search_cache_path(cache_key: str) -> Path:
-    return CACHE_DIR / f"search-{cache_key}.json"
+    return base_dir / f"search-{h.hexdigest()}.json"
 
 
-def _package_result_from_dict(data: dict[str, str]) -> PackageResult:
-    return PackageResult(
-        name=data.get("name", ""),
-        version=data.get("version", ""),
-        description=data.get("description", ""),
-        backend=data.get("backend", ""),
-        app_id=data.get("app_id", ""),
-    )
-
-
-def _load_search_cache(query: str) -> list[PackageResult] | None:
-    cfg_path, _ = find_config_path()
-    script_path = Path(__file__).resolve()
-    cache_file = _search_cache_path(_search_cache_key(query, cfg_path, script_path))
-
+def _load_search_cache(query: str, backends: list[str]) -> list[PackageResult] | None:
+    cache_file = _cache_file_for(query, backends)
     if not cache_file.exists():
         return None
+    # Allow TTL to be configured via config file
+    try:
+        config = load_config()
+        ttl = config.getint("smpt", "cache_ttl_seconds", fallback=CACHE_TTL_SECONDS)
+    except Exception:
+        ttl = CACHE_TTL_SECONDS
 
-    if time.time() - cache_file.stat().st_mtime > CACHE_TTL_SECONDS:
+    if ttl <= 0:
+        return None
+
+    if time.time() - cache_file.stat().st_mtime > ttl:
         try:
             cache_file.unlink()
         except OSError:
             pass
         return None
-
     try:
         data = json.loads(cache_file.read_text(encoding="utf-8"))
-        return [_package_result_from_dict(item) for item in data]
+        return [PackageResult.from_dict(item) for item in data]
     except (OSError, json.JSONDecodeError):
         return None
 
 
-def _save_search_cache(query: str, results: list[PackageResult]) -> None:
-    cfg_path, _ = find_config_path()
-    script_path = Path(__file__).resolve()
-    cache_file = _search_cache_path(_search_cache_key(query, cfg_path, script_path))
-
+def _save_search_cache(query: str, results: list[PackageResult], backends: list[str]) -> None:
+    cache_file = _cache_file_for(query, backends)
     try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(
-            json.dumps([result.to_dict() for result in results], ensure_ascii=False),
-            encoding="utf-8",
-        )
+        cache_dir = cache_file.parent
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Write to a temporary file in the same directory and atomically rename
+        # to avoid partial/corrupt cache files if the process is interrupted.
+        tmp = None
+        try:
+            tmpf = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(cache_dir), delete=False, prefix="search-")
+            tmp = tmpf.name
+            json.dump([r.to_dict() for r in results], tmpf, ensure_ascii=False)
+            tmpf.flush()
+            os.fsync(tmpf.fileno())
+            tmpf.close()
+            os.replace(tmp, cache_file)
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
     except OSError:
         pass
 
@@ -996,23 +1049,27 @@ def parallel_search_backends(query: str, backends: list[str], name_filter: bool)
     Run package backend search functions in parallel threads.
     Returns a combined list of PackageResult items after optional per-backend name filtering.
     """
+    cached = _load_search_cache(query, backends)
+    if cached is not None:
+        q = query.lower()
+        filtered = [p for p in cached if p.matches_query(q)] if (name_filter and query) else cached
+        # Show that cached results were used and their age.
+        try:
+            cache_file = _cache_file_for(query, backends)
+            age = max(0, time.time() - cache_file.stat().st_mtime)
+            print(f"  cache: loaded {len(cached)} cached result(s) (age {age/3600:.1f}h)")
+        except Exception:
+            pass
+        for backend in backends:
+            print(f"  {backend}: {sum(1 for p in filtered if p.backend == backend)} result(s)")
+        return filtered
+
     all_results: list[PackageResult] = []
     filtered_results: list[PackageResult] = []
     futures: dict[str, Future] = {}
 
-    cached = _load_search_cache(query)
-    if cached is not None:
-        if name_filter and query:
-            filtered_results = [p for p in cached if p.matches_query(query.lower())]
-        else:
-            filtered_results = list(cached)
-
-        for backend in backends:
-            count = sum(1 for p in filtered_results if p.backend == backend)
-            print(f"  {backend}: {count} result(s)")
-        return filtered_results
-
-    with ThreadPoolExecutor(max_workers=max(1, len(backends))) as executor:
+    max_workers = min(max(1, len(backends)), BACKEND_MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for backend in backends:
             fn = SEARCH_FUNCTIONS.get(backend)
             if fn:
@@ -1024,7 +1081,10 @@ def parallel_search_backends(query: str, backends: list[str], name_filter: bool)
                 continue
 
             try:
-                found = future.result()
+                found = future.result(timeout=BACKEND_SEARCH_TIMEOUT_SECONDS)
+            except TimeoutError:
+                print(f"  {backend}: search timed out after {BACKEND_SEARCH_TIMEOUT_SECONDS}s")
+                found = []
             except Exception as exc:
                 print(f"  {backend}: error during search: {exc}")
                 found = []
@@ -1038,7 +1098,7 @@ def parallel_search_backends(query: str, backends: list[str], name_filter: bool)
             print(f"  {backend}: {len(found)} result(s)")
             filtered_results.extend(found)
 
-    _save_search_cache(query, all_results)
+    _save_search_cache(query, all_results, backends)
     return filtered_results
 
 
@@ -1057,25 +1117,6 @@ def bold(text):  return colorize(text, "1")
 def cyan(text):  return colorize(text, "36")
 def yellow(text):return colorize(text, "33")
 def dim(text):   return colorize(text, "2")
-
-
-def print_results(merged: list[MergedResult]) -> None:
-    if not merged:
-        print("No results found.")
-        return
-
-    print(f"\n  {'#':<4} {'Package':<35} {'Version':<18} {'Source':<12} Description")
-    print("  " + "-" * 100)
-
-    for i, pkg in enumerate(merged):
-        index   = bold(f"[{i + 1}]")
-        name    = cyan(f"{pkg.name:<35}")
-        version = dim(f"{pkg.version:<18}") if pkg.version else f"{'':18}"
-        source  = yellow(f"{pkg.source_tag():<12}")
-        desc    = pkg.description[:55] + "…" if len(pkg.description) > 55 else pkg.description
-        print(f"  {index:<6} {name} {version} {source} {desc}")
-
-    print()
 
 
 # ---------------------------------------------------------------------------
@@ -1097,19 +1138,13 @@ INFO_COMMANDS: dict[str, list[str]] = {
 }
 
 def get_install_command(pkg: MergedResult, backend: str) -> str:
-    """Return the shell command string a user would type to install this package."""
-    pkg_id = pkg.pkg_id(backend)
-    cmds = {
-        "flatpak":    f"flatpak install flathub {pkg_id}",
-        "brew":       f"brew install {pkg_id}",
-        "cargo":      f"cargo install {pkg_id}",
-        "apt":        f"sudo apt install {pkg_id}",
-        "dnf":        f"sudo dnf install {pkg_id}",
-        "pacman":     f"sudo pacman -S {pkg_id}",
-        "rpm-ostree": f"rpm-ostree install {pkg_id}",
-        "appman":     f"appman install {pkg_id}",
-    }
-    return cmds.get(backend, f"{backend} install {pkg_id}")
+    """Return the install command as a display string (space-joined).
+    Derived from INSTALL_COMMANDS so the two never go out of sync."""
+    pkg_id   = pkg.pkg_id(backend)
+    template = INSTALL_COMMANDS.get(backend)
+    if not template:
+        return f"{backend} install {pkg_id}"
+    return " ".join(part.replace("{id}", pkg_id) for part in template)
 
 
 def run_info(pkg: MergedResult, backend: str) -> None:
@@ -1193,55 +1228,42 @@ def build_install_cmd(backend: str, pkg_ids: list[str],
     return base
 
 
+def _run_pkg_command(cmd: list[str], dry_run: bool = False) -> int:
+    """
+    Print and optionally execute a package manager command.
+    Returns returncode (0 = success, 0 for dry-run).
+    """
+    print(f"\n  {dim('$')} {' '.join(cmd)}")
+    if dry_run:
+        print(f"  {yellow('[dry-run] Command not executed.')}")
+        return 0
+    print()
+    return subprocess.run(cmd).returncode
+
+
 def run_install(pkg: MergedResult, backend: str,
                 dry_run: bool = False, yes: bool = False) -> int:
-    """
-    Run the install command for a single package.
-    Returns the subprocess returncode (0 = success).
-    """
+    """Run the install command for a single package."""
     pkg_id = pkg.pkg_id(backend)
     cmd = build_install_cmd(backend, [pkg_id], yes=yes)
     if not cmd:
         print(f"  [smpt] No install command defined for {backend}.")
         return 1
-
-    print(f"\n  {dim('$')} {' '.join(cmd)}")
-
-    if dry_run:
-        print(f"  {yellow('[dry-run] Command not executed.')}")
-        return 0
-
-    print()
-    result = subprocess.run(cmd)
-    return result.returncode
+    return _run_pkg_command(cmd, dry_run)
 
 
 def run_uninstall(pkg: MergedResult, backend: str,
                   dry_run: bool = False, yes: bool = False) -> int:
-    """
-    Run the uninstall command for a single package.
-    Returns the subprocess returncode (0 = success).
-    """
-    pkg_id = pkg.pkg_id(backend)
+    """Run the uninstall command for a single package."""
+    pkg_id   = pkg.pkg_id(backend)
     template = UNINSTALL_COMMANDS.get(backend)
     if not template:
         print(f"  [smpt] No uninstall command defined for {backend}.")
         return 1
-
     cmd = [part.replace("{id}", pkg_id) for part in template]
     if yes:
-        flags = YES_FLAGS.get(backend, [])
-        cmd.extend(flags)
-
-    print(f"\n  {dim('$')} {' '.join(cmd)}")
-
-    if dry_run:
-        print(f"  {yellow('[dry-run] Command not executed.')}")
-        return 0
-
-    print()
-    result = subprocess.run(cmd)
-    return result.returncode
+        cmd.extend(YES_FLAGS.get(backend, []))
+    return _run_pkg_command(cmd, dry_run)
 
 
 def run_batch(resolved: list[ResolvedPackage],
@@ -1349,12 +1371,17 @@ def _read_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def _term_cols() -> int:
-    """Return terminal width, defaulting to 100 if unavailable."""
+def _term_size() -> tuple[int, int]:
+    """Return (columns, lines), defaulting to (100, 24) if unavailable."""
     try:
-        return os.get_terminal_size().columns
+        sz = os.get_terminal_size()
+        return sz.columns, sz.lines
     except OSError:
-        return 100
+        return 100, 24
+
+
+def _term_cols() -> int:
+    return _term_size()[0]
 
 
 def _format_row(pkg: MergedResult, i: int, cursor: int) -> str:
@@ -1390,11 +1417,7 @@ def _format_row(pkg: MergedResult, i: int, cursor: int) -> str:
 
 
 def _term_rows() -> int:
-    """Return terminal height, defaulting to 24 if unavailable."""
-    try:
-        return os.get_terminal_size().lines
-    except OSError:
-        return 24
+    return _term_size()[1]
 
 
 # Lines consumed by header (blank+header+separator) and footer (blank+hint).
@@ -1508,8 +1531,10 @@ def prompt_selection(merged: list[MergedResult],
             raw = input(f"Select [1-{len(merged)}] (default: {default+1}, q to quit): ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
-        if raw.lower() in ("q", "quit", "") or raw == "":
+        if raw == "":
             return merged[default]
+        if raw.lower() in ("q", "quit"):
+            return None
         try:
             choice = int(raw)
             if 1 <= choice <= len(merged):
@@ -1581,42 +1606,6 @@ def prompt_selection(merged: list[MergedResult],
             except ValueError:
                 pass
 
-
-
-def prompt_backend(result: MergedResult, action: str = "use") -> str | None:
-    """
-    If a result comes from multiple backends, ask the user which one to use.
-    `action` is shown in the prompt (e.g. "install", "get info for").
-    Returns the chosen backend name, or None if cancelled.
-    """
-    if len(result.backends) == 1:
-        return result.backends[0]
-
-    print(f"\n  '{result.name}' is available from multiple sources.")
-    print(f"  Which would you like to {action}?")
-    for i, backend in enumerate(result.backends):
-        marker = bold(f"[{i + 1}]") if i > 0 else bold("[1]")
-        default = dim("  (default)") if i == 0 else ""
-        print(f"    {marker}  {backend}{default}")
-
-    while True:
-        try:
-            raw = input(f"  Choose [1-{len(result.backends)}] (default: 1): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-
-        if raw == "":
-            return result.backends[0]
-
-        try:
-            choice = int(raw)
-            if 1 <= choice <= len(result.backends):
-                return result.backends[choice - 1]
-        except ValueError:
-            pass
-
-        print("  Invalid input.")
 
 
 def wrap(text: str, width: int = 66, indent: str = "  ") -> str:
@@ -1695,12 +1684,16 @@ def _update_detail_menu(options: list, cursor: int) -> None:
 
 
 def prompt_backend_arrow(result: MergedResult, action: str = "use",
-                          default: str | None = None, installed: list[PackageResult] = []) -> str | None:
+                          default: str | None = None,
+                          installed: list[PackageResult] | None = None) -> str | None:
     """
     Arrow-key driven backend picker for multi-source packages.
     default: backend name to pre-select (defaults to first in list).
     Falls back to plain input if stdin is not a tty.
     """
+    if installed is None:
+        installed = []
+
     if len(result.backends) == 1:
         return result.backends[0]
 
@@ -1912,6 +1905,35 @@ def detail_menu(pkg: MergedResult, backend: str, config: configparser.ConfigPars
 # Command: search
 # ---------------------------------------------------------------------------
 
+
+def _run_selection_loop(merged: list[MergedResult],
+                        installed: list[PackageResult],
+                        config: configparser.ConfigParser,
+                        dry_run: bool = False,
+                        yes: bool = False) -> None:
+    """
+    Shared interactive loop used by cmd_search and cmd_info.
+    Shows the package list, lets the user pick a package and backend,
+    then hands off to detail_menu. Loops until the user quits or installs.
+    """
+    while True:
+        chosen_pkg = prompt_selection(merged)
+        if chosen_pkg is None:
+            print("Cancelled.")
+            return
+
+        chosen_backend = prompt_backend_arrow(chosen_pkg,
+                                              action="view details for",
+                                              installed=installed)
+        if chosen_backend is None:
+            continue
+
+        go_back = detail_menu(chosen_pkg, chosen_backend, config,
+                              dry_run=dry_run, yes=yes)
+        if not go_back:
+            return
+
+
 def cmd_search(query: str, config: configparser.ConfigParser,
                dry_run: bool = False, yes: bool = False,
                search_desc: bool = False) -> None:
@@ -1941,26 +1963,7 @@ def cmd_search(query: str, config: configparser.ConfigParser,
         print(f"\nNo packages found matching '{query}'.")
         return
 
-    # Main results loop — stays here until user installs or quits
-    while True:
-        # prompt_selection draws the results table itself (arrow-key UI)
-        chosen_pkg = prompt_selection(merged)
-        if chosen_pkg is None:
-            print("Cancelled.")
-            return
-
-        # Resolve backend before showing detail — single-source skips the prompt
-        chosen_backend = prompt_backend_arrow(chosen_pkg, action="view details for", installed=installed)
-        if chosen_backend is None:
-            # User cancelled the backend picker — go back to results
-            continue
-
-        # Show detail view scoped to the chosen backend
-        # Returns True = back to results, False = exit
-        go_back = detail_menu(chosen_pkg, chosen_backend, config,
-                              dry_run=dry_run, yes=yes)
-        if not go_back:
-            return
+    _run_selection_loop(merged, installed, config, dry_run=dry_run, yes=yes)
 
 
 def cmd_info(query: str, config: configparser.ConfigParser,
@@ -1998,26 +2001,7 @@ def cmd_info(query: str, config: configparser.ConfigParser,
         print(f"\nNo installed packages found matching '{query}'.")
         return
 
-    # Main results loop — same as search
-    while True:
-        # prompt_selection draws the results table itself (arrow-key UI)
-        chosen_pkg = prompt_selection(merged)
-        if chosen_pkg is None:
-            print("Cancelled.")
-            return
-
-        # Resolve backend before showing detail — single-source skips the prompt
-        chosen_backend = prompt_backend_arrow(chosen_pkg, action="view details for", installed=installed)
-        if chosen_backend is None:
-            # User cancelled the backend picker — go back to results
-            continue
-
-        # Show detail view scoped to the chosen backend
-        # Returns True = back to results, False = exit
-        go_back = detail_menu(chosen_pkg, chosen_backend, config,
-                              dry_run=dry_run, yes=yes)
-        if not go_back:
-            return
+    _run_selection_loop(merged, installed, config, dry_run=dry_run, yes=yes)
 
 
 def resolve_one(query: str, backends: list[str], config: configparser.ConfigParser,
@@ -2122,30 +2106,17 @@ def cmd_install(query: str, config: configparser.ConfigParser,
     else:
         queries = query.split()
 
-    # ── Already-installed check for -y multi-package ──────────────────────
-    if yes and len(queries) > 1:
-        installed_names: set[str] = set()
-        for q in queries:
-            found = check_installed(q, backends)
-            if any(is_exact_match(
-                MergedResult(p.name, p.version, p.description, [p.backend]), q
-            ) for p in found):
-                print(f"[smpt] '{q}' is already installed. Skipping.")
-                installed_names.add(q)
-        queries = [q for q in queries if q not in installed_names]
-        if not queries:
-            return
-
     # ── Resolve each package ──────────────────────────────────────────────
-    # Multi-package installs always auto-select the best exact match (like -y)
-    # so the user isn't walked through a separate UI for every package.
-    # The confirmation step in run_batch is where they get to review and approve.
+    # Multi-package installs always auto-select the best exact match (like -y).
+    # The confirmation step in run_batch is where the user reviews and approves.
     auto = yes or len(queries) > 1
 
     resolved: list[ResolvedPackage] = []
     for q in queries:
-        # Skip if already installed from any source (multi-package only)
-        if len(queries) > 1:
+        # In multi-package or -y mode, skip packages already installed
+        # from any source. Single interactive installs always proceed so the
+        # user can still reinstall or switch sources.
+        if len(queries) > 1 or yes:
             already = check_installed(q, backends)
             exact_installed = [p for p in already if q.lower() in p.name.lower()]
             if exact_installed:
