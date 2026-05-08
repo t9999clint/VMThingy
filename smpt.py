@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 smpt - Simple Multi-Package Tool
-Discovery prototype: 'smpt search <package>' only.
+A unified frontend for multiple package managers.
 """
 
 import sys
@@ -10,6 +10,14 @@ import subprocess
 import configparser
 import tty
 import termios
+import shutil
+import stat
+import json
+import time
+import tempfile
+import hashlib
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +44,24 @@ class PackageResult:
         q = query.lower()
         return q in self.name.lower() or (bool(self.app_id) and q in self.app_id.lower())
 
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "description": self.description,
+            "backend": self.backend,
+            "app_id": self.app_id,
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, str]) -> "PackageResult":
+        return PackageResult(
+            name=data.get("name", ""),
+            version=data.get("version", ""),
+            description=data.get("description", ""),
+            backend=data.get("backend", ""),
+            app_id=data.get("app_id", ""),
+        )
 
 
 @dataclass
@@ -47,6 +73,7 @@ class MergedResult:
     backends: list[str] = field(default_factory=list)
     app_ids: dict[str, str] = field(default_factory=dict)       # backend -> app_id
     descriptions: dict[str, str] = field(default_factory=dict)  # backend -> description
+    is_installed: bool = False
 
     def source_tag(self) -> str:
         if len(self.backends) == 1:
@@ -70,9 +97,6 @@ class ResolvedPackage:
     query:   str           # the original search term the user typed
     pkg:     MergedResult  # the chosen result
     backend: str           # the chosen backend to install from
-
-    def pkg_id(self) -> str:
-        return self.pkg.pkg_id(self.backend)
 
     def install_id(self) -> str:
         """The identifier to pass to the install command for this backend."""
@@ -131,6 +155,14 @@ color = true
 # query string. Set to false to see all results (including description matches).
 name_filter = true
 
+# Cache settings
+# `cache_ttl_seconds` controls how long (in seconds) cached search results
+# are considered valid. Set to 0 to disable caching.
+cache_ttl_seconds = 86400
+# `cache_dir` can be used to override the default cache directory. Leave
+# empty to use the system temp directory.
+cache_dir = 
+
 # ---------------------------------------------------------------------------
 # Backend sections
 # Each backend has three settings:
@@ -146,12 +178,12 @@ warn_on_install = false
 
 [brew]
 enabled = true
-priority = 20
+priority = 30
 warn_on_install = false
 
 [cargo]
 enabled = true
-priority = 30
+priority = 35
 warn_on_install = false
 
 [apt]
@@ -178,6 +210,11 @@ warn_on_install = true
 [appman]
 enabled = true
 priority = 25
+warn_on_install = false
+
+[conda]
+enabled = true
+priority = 35
 warn_on_install = false
 """
 
@@ -223,9 +260,10 @@ def load_config() -> configparser.ConfigParser:
 # Keeps them usable but ranked below any explicitly configured backends.
 _DEFAULT_PRIORITY = {
     "flatpak":    10,
-    "appman":     20,
-    "brew":       20,
-    "cargo":      40,
+    "appman":     25,
+    "brew":       30,
+    "cargo":      35,
+    "conda":      35,
     "apt":        40,
     "dnf":        40,
     "pacman":     40,
@@ -270,7 +308,6 @@ def get_enabled_backends(config: configparser.ConfigParser) -> list[str]:
 
 def command_exists(cmd: str) -> bool:
     """Return True if `cmd` is on PATH."""
-    import shutil
     return shutil.which(cmd) is not None
 
 
@@ -285,6 +322,7 @@ def is_backend_available(backend: str) -> bool:
         "pacman":     lambda: command_exists("pacman"),
         "rpm-ostree": lambda: command_exists("rpm-ostree") and Path("/run/ostree-booted").exists(),
         "appman":     lambda: command_exists("appman"),
+        "conda":      lambda: command_exists("conda"),
         # Future backends go here
     }
     check = checks.get(backend)
@@ -321,10 +359,18 @@ def _parse_flatpak_lines(lines: list[str], query: str = "") -> list[PackageResul
     Uses the last segment of the application ID as the package name
     (e.g. "org.virt_manager.virt-manager" -> "virt-manager") so that
     flatpak results deduplicate correctly against other backends.
+    
+    When multiple apps have the same final segment (e.g. "player"),
+    uses the second-to-last segment instead (e.g. "easyrpg" vs "ecotubehq")
+    to avoid collisions while still allowing deduplication across other backends.
+    
     The human-readable display name is prepended to the description so
     it remains visible in the results table.
     """
-    results = []
+    # First pass: parse all entries and detect name collisions
+    parsed_entries = []
+    final_segments = {}  # segment -> list of app_ids with this segment
+    
     q = query.lower()
     for line in lines:
         parts = line.split("\t")
@@ -338,8 +384,32 @@ def _parse_flatpak_lines(lines: list[str], query: str = "") -> list[PackageResul
         if not app_id or display_name.lower() == "name":
             continue  # skip empty / header rows
 
-        # Use the last segment of the app ID as the canonical package name
-        pkg_name = app_id.rsplit(".", 1)[-1]
+        parsed_entries.append((display_name, app_id, version, desc))
+        
+        # Track which app_ids have the same final segment
+        final = app_id.rsplit(".", 1)[-1]
+        if final not in final_segments:
+            final_segments[final] = []
+        final_segments[final].append(app_id)
+    
+    # Determine which final segments have collisions
+    collision_segments = {seg for seg, ids in final_segments.items() if len(ids) > 1}
+    
+    # Second pass: build PackageResults with appropriate names
+    results = []
+    for display_name, app_id, version, desc in parsed_entries:
+        # Determine the package name: use second-to-last segment if there's a collision
+        app_id_parts = app_id.rsplit(".", 1)
+        final = app_id_parts[-1]
+        
+        if final in collision_segments:
+            # Use second-to-last segment to disambiguate
+            if len(app_id_parts) > 1:
+                pkg_name = app_id_parts[0].rsplit(".", 1)[-1]
+            else:
+                pkg_name = final  # fallback if only one segment
+        else:
+            pkg_name = final
 
         # Combine display name + description so neither is lost
         full_desc = f"{display_name}: {desc}" if desc else display_name
@@ -486,13 +556,31 @@ def search_pacman(query: str) -> list[PackageResult]:
 
 
 def search_rpm_ostree(query: str) -> list[PackageResult]:
-    # rpm-ostree has no search command — delegate to dnf/dnf5.
-    stdout, _, rc = run(["dnf", "search", query])
+    """
+    Parse `rpm-ostree search` output.
+    Output format:
+      ===== Summary & Name Matched =====
+      firefox : Mozilla Firefox Web browser
+      firefox-langpacks : Firefox langpacks
+    """
+    stdout, _, rc = run(["rpm-ostree", "search", query])
     if rc != 0 or not stdout.strip():
         return []
-    # Reuse the same parser but tag results as rpm-ostree so the
-    # install step knows to call `rpm-ostree install` not `dnf install`.
-    return parse_dnf_output(stdout, "rpm-ostree")
+
+    results = []
+    for line in stdout.strip().splitlines():
+        line = line.strip()
+        # Skip section headers and empty lines
+        if line.startswith("=====") or not line:
+            continue
+        # Parse "name : description" format
+        if " : " in line:
+            name, desc = line.split(" : ", 1)
+            name = name.strip()
+            desc = desc.strip()
+            results.append(PackageResult(name, "", desc, "rpm-ostree"))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -544,11 +632,12 @@ def installed_dnf(query: str) -> list[PackageResult]:
 
 
 def installed_rpm_ostree(query: str) -> list[PackageResult]:
-    # Layered packages show up in rpm -qa just like regular dnf installs
-    results = installed_dnf(query)
-    for r in results:
-        r.backend = "rpm-ostree"
-    return results
+    # Layered packages show up in rpm -qa just like regular dnf installs.
+    # Build new PackageResult objects rather than mutating the dnf results.
+    return [
+        PackageResult(r.name, r.version, r.description, "rpm-ostree", r.app_id)
+        for r in installed_dnf(query)
+    ]
 
 
 def installed_pacman(query: str) -> list[PackageResult]:
@@ -642,6 +731,40 @@ def search_appman(query: str) -> list[PackageResult]:
     return results
 
 
+def search_conda(query: str) -> list[PackageResult]:
+    """
+    Parse `conda search <query> --json` output.
+    Uses wildcards around query for better results.
+    JSON format is easier to parse than tabular output.
+    """
+    # Add wildcards for better search results as suggested in conda docs
+    search_query = f"*{query}*"
+    # Conda search can be slow, use longer timeout
+    stdout, _, rc = run(["conda", "search", search_query, "--json"], timeout=45)
+    
+    if rc != 0 or not stdout.strip():
+        return []
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+
+    def version_key(v: dict) -> list[int]:
+        """Sort key for version strings — compares numeric segments only."""
+        return [int(x) for x in v["version"].split('.') if x.isdigit()]
+
+    results = []
+    # The JSON structure is {package_name: [versions...]}
+    for pkg_name, versions in data.items():
+        if versions:
+            latest = max(versions, key=version_key)
+            version = latest.get("version", "")
+            results.append(PackageResult(pkg_name, version, "", "conda"))
+
+    return results
+
+
 def _appman_install_dir() -> Path | None:
     """
     Read the user-chosen install directory from appman's config file.
@@ -712,6 +835,32 @@ def installed_appman(query: str) -> list[PackageResult]:
     return results
 
 
+def installed_conda(query: str) -> list[PackageResult]:
+    """
+    Parse `conda list --json` output to find installed packages.
+    JSON format is easier to parse than tabular output.
+    """
+    stdout, _, rc = run(["conda", "list", "--json"], timeout=30)
+    if rc != 0 or not stdout.strip():
+        return []
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+
+    results = []
+    q = query.lower()
+    # The JSON structure is a list of package objects
+    for pkg in data:
+        name = pkg.get("name", "")
+        version = pkg.get("version", "")
+        if q in name.lower():
+            results.append(PackageResult(name, version, "", "conda"))
+
+    return results
+
+
 INSTALLED_FUNCTIONS = {
     "flatpak":    installed_flatpak,
     "apt":        installed_apt,
@@ -721,6 +870,7 @@ INSTALLED_FUNCTIONS = {
     "brew":       installed_brew,
     "cargo":      installed_cargo,
     "appman":     installed_appman,
+    "conda":      installed_conda,
 }
 
 
@@ -744,6 +894,7 @@ SEARCH_FUNCTIONS = {
     "pacman":     search_pacman,
     "rpm-ostree": search_rpm_ostree,
     "appman":     search_appman,
+    "conda":      search_conda,
 }
 
 
@@ -756,11 +907,6 @@ def merge_results(
     query: str = "",
     name_filter: bool = True,
 ) -> list[MergedResult]:
-    """
-    Deduplicate by package name (case-insensitive).
-    The first occurrence (highest-priority backend) provides version/description.
-    Subsequent occurrences just add their backend to the list.
-    """
     """
     Deduplicate by package name (case-insensitive).
     The first occurrence (highest-priority backend) provides version/description.
@@ -803,6 +949,159 @@ def merge_results(
     return list(seen.values())
 
 
+CACHE_TTL_SECONDS = 24 * 3600
+CACHE_DIR = Path(tempfile.gettempdir()) / "smpt_search_cache"
+
+# Concurrency and timeout tuning
+BACKEND_SEARCH_TIMEOUT_SECONDS = 30
+BACKEND_MAX_WORKERS = 8
+
+# Computed once per run — config and script path don't change mid-session
+_CACHE_STATIC_PATH = Path(__file__).resolve()
+
+
+def _cache_file_for(query: str, backends: list[str]) -> Path:
+    """Return the cache file path for a given query and backend set.
+
+    The hash includes the query, the sorted backend list, and the current
+    PATH environment so that changes to available backends or install
+    locations invalidate the cache. The actual cache directory may be
+    overridden in the user's config under [smpt].
+    """
+    cfg_path, _ = find_config_path()
+    # Allow user to override cache directory via config
+    try:
+        config = load_config()
+        configured_dir = config.get("smpt", "cache_dir", fallback="").strip()
+    except Exception:
+        configured_dir = ""
+
+    base_dir = Path(os.path.expanduser(configured_dir)) if configured_dir else CACHE_DIR
+    h = hashlib.sha256()
+    h.update(query.encode("utf-8"))
+    backend_key = ",".join(sorted(backends)) if backends else ""
+    h.update(backend_key.encode("utf-8"))
+    h.update(os.environ.get("PATH", "").encode("utf-8"))
+    for path in (cfg_path, _CACHE_STATIC_PATH):
+        try:
+            h.update(str(path.stat().st_mtime).encode("utf-8"))
+            h.update(str(path).encode("utf-8"))
+        except OSError:
+            h.update(str(path).encode("utf-8"))
+    return base_dir / f"search-{h.hexdigest()}.json"
+
+
+def _load_search_cache(query: str, backends: list[str]) -> list[PackageResult] | None:
+    cache_file = _cache_file_for(query, backends)
+    if not cache_file.exists():
+        return None
+    # Allow TTL to be configured via config file
+    try:
+        config = load_config()
+        ttl = config.getint("smpt", "cache_ttl_seconds", fallback=CACHE_TTL_SECONDS)
+    except Exception:
+        ttl = CACHE_TTL_SECONDS
+
+    if ttl <= 0:
+        return None
+
+    if time.time() - cache_file.stat().st_mtime > ttl:
+        try:
+            cache_file.unlink()
+        except OSError:
+            pass
+        return None
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        return [PackageResult.from_dict(item) for item in data]
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_search_cache(query: str, results: list[PackageResult], backends: list[str]) -> None:
+    cache_file = _cache_file_for(query, backends)
+    try:
+        cache_dir = cache_file.parent
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Write to a temporary file in the same directory and atomically rename
+        # to avoid partial/corrupt cache files if the process is interrupted.
+        tmp = None
+        try:
+            tmpf = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(cache_dir), delete=False, prefix="search-")
+            tmp = tmpf.name
+            json.dump([r.to_dict() for r in results], tmpf, ensure_ascii=False)
+            tmpf.flush()
+            os.fsync(tmpf.fileno())
+            tmpf.close()
+            os.replace(tmp, cache_file)
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def parallel_search_backends(query: str, backends: list[str], name_filter: bool) -> list[PackageResult]:
+    """
+    Run package backend search functions in parallel threads.
+    Returns a combined list of PackageResult items after optional per-backend name filtering.
+    """
+    cached = _load_search_cache(query, backends)
+    if cached is not None:
+        q = query.lower()
+        filtered = [p for p in cached if p.matches_query(q)] if (name_filter and query) else cached
+        # Show that cached results were used and their age.
+        try:
+            cache_file = _cache_file_for(query, backends)
+            age = max(0, time.time() - cache_file.stat().st_mtime)
+            print(f"  cache: loaded {len(cached)} cached result(s) (age {age/3600:.1f}h)")
+        except Exception:
+            pass
+        for backend in backends:
+            print(f"  {backend}: {sum(1 for p in filtered if p.backend == backend)} result(s)")
+        return filtered
+
+    all_results: list[PackageResult] = []
+    filtered_results: list[PackageResult] = []
+    futures: dict[str, Future] = {}
+
+    max_workers = min(max(1, len(backends)), BACKEND_MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for backend in backends:
+            fn = SEARCH_FUNCTIONS.get(backend)
+            if fn:
+                futures[backend] = executor.submit(fn, query)
+
+        for backend in backends:
+            future = futures.get(backend)
+            if future is None:
+                continue
+
+            try:
+                found = future.result(timeout=BACKEND_SEARCH_TIMEOUT_SECONDS)
+            except TimeoutError:
+                print(f"  {backend}: search timed out after {BACKEND_SEARCH_TIMEOUT_SECONDS}s")
+                found = []
+            except Exception as exc:
+                print(f"  {backend}: error during search: {exc}")
+                found = []
+
+            all_results.extend(found)
+
+            if name_filter and query:
+                q = query.lower()
+                found = [p for p in found if p.matches_query(q)]
+
+            print(f"  {backend}: {len(found)} result(s)")
+            filtered_results.extend(found)
+
+    _save_search_cache(query, all_results, backends)
+    return filtered_results
+
+
 # ---------------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------------
@@ -820,25 +1119,6 @@ def yellow(text):return colorize(text, "33")
 def dim(text):   return colorize(text, "2")
 
 
-def print_results(merged: list[MergedResult]) -> None:
-    if not merged:
-        print("No results found.")
-        return
-
-    print(f"\n  {'#':<4} {'Package':<35} {'Version':<18} {'Source':<12} Description")
-    print("  " + "-" * 100)
-
-    for i, pkg in enumerate(merged):
-        index   = bold(f"[{i + 1}]")
-        name    = cyan(f"{pkg.name:<35}")
-        version = dim(f"{pkg.version:<18}") if pkg.version else f"{'':18}"
-        source  = yellow(f"{pkg.source_tag():<12}")
-        desc    = pkg.description[:55] + "…" if len(pkg.description) > 55 else pkg.description
-        print(f"  {index:<6} {name} {version} {source} {desc}")
-
-    print()
-
-
 # ---------------------------------------------------------------------------
 # Backend info commands
 # ---------------------------------------------------------------------------
@@ -853,23 +1133,18 @@ INFO_COMMANDS: dict[str, list[str]] = {
     "dnf":        ["dnf",    "info",         "{id}"],
     "pacman":     ["pacman", "-Si",          "{id}"],
     "rpm-ostree": ["dnf",    "info",         "{id}"],
-    "appman":     ["appman", "about",          "{id}"],
+    "appman":     ["appman", "about",        "{id}"],
+    "conda":      ["conda",  "search",       "--info", "{id}"],
 }
 
 def get_install_command(pkg: MergedResult, backend: str) -> str:
-    """Return the shell command string a user would type to install this package."""
-    pkg_id = pkg.pkg_id(backend)
-    cmds = {
-        "flatpak":    f"flatpak install flathub {pkg_id}",
-        "brew":       f"brew install {pkg_id}",
-        "cargo":      f"cargo install {pkg_id}",
-        "apt":        f"sudo apt install {pkg_id}",
-        "dnf":        f"sudo dnf install {pkg_id}",
-        "pacman":     f"sudo pacman -S {pkg_id}",
-        "rpm-ostree": f"rpm-ostree install {pkg_id}",
-        "appman":     f"appman install {pkg_id}",
-    }
-    return cmds.get(backend, f"{backend} install {pkg_id}")
+    """Return the install command as a display string (space-joined).
+    Derived from INSTALL_COMMANDS so the two never go out of sync."""
+    pkg_id   = pkg.pkg_id(backend)
+    template = INSTALL_COMMANDS.get(backend)
+    if not template:
+        return f"{backend} install {pkg_id}"
+    return " ".join(part.replace("{id}", pkg_id) for part in template)
 
 
 def run_info(pkg: MergedResult, backend: str) -> None:
@@ -893,6 +1168,20 @@ INSTALL_COMMANDS: dict[str, list[str]] = {
     "pacman":     ["sudo",    "pacman",  "-S",       "{id}"],
     "rpm-ostree": ["rpm-ostree", "install",          "{id}"],
     "appman":     ["appman",     "install",          "{id}"],
+    "conda":      ["conda",      "install",          "{id}"],
+}
+
+# Maps each backend to its uninstall command tokens. {id} = package identifier.
+UNINSTALL_COMMANDS: dict[str, list[str]] = {
+    "flatpak":    ["flatpak", "uninstall", "{id}"],
+    "brew":       ["brew",    "uninstall", "{id}"],
+    "cargo":      ["cargo",   "uninstall", "{id}"],
+    "apt":        ["sudo",    "apt",     "remove",  "{id}"],
+    "dnf":        ["sudo",    "dnf",     "remove",  "{id}"],
+    "pacman":     ["sudo",    "pacman",  "-R",     "{id}"],
+    "rpm-ostree": ["rpm-ostree", "uninstall",      "{id}"],
+    "appman":     ["appman",     "uninstall",      "{id}"],
+    "conda":      ["conda",      "remove",         "{id}"],
 }
 
 # Flags that suppress interactive prompts for each backend (used with -y)
@@ -905,6 +1194,7 @@ YES_FLAGS: dict[str, list[str]] = {
     "pacman":     ["--noconfirm"],
     "rpm-ostree": ["-y"],
     "appman":     [],   # appman has no non-interactive flag; prompts are minimal
+    "conda":      ["-y"],
 }
 
 
@@ -938,27 +1228,42 @@ def build_install_cmd(backend: str, pkg_ids: list[str],
     return base
 
 
+def _run_pkg_command(cmd: list[str], dry_run: bool = False) -> int:
+    """
+    Print and optionally execute a package manager command.
+    Returns returncode (0 = success, 0 for dry-run).
+    """
+    print(f"\n  {dim('$')} {' '.join(cmd)}")
+    if dry_run:
+        print(f"  {yellow('[dry-run] Command not executed.')}")
+        return 0
+    print()
+    return subprocess.run(cmd).returncode
+
+
 def run_install(pkg: MergedResult, backend: str,
                 dry_run: bool = False, yes: bool = False) -> int:
-    """
-    Run the install command for a single package.
-    Returns the subprocess returncode (0 = success).
-    """
+    """Run the install command for a single package."""
     pkg_id = pkg.pkg_id(backend)
     cmd = build_install_cmd(backend, [pkg_id], yes=yes)
     if not cmd:
         print(f"  [smpt] No install command defined for {backend}.")
         return 1
+    return _run_pkg_command(cmd, dry_run)
 
-    print(f"\n  {dim('$')} {' '.join(cmd)}")
 
-    if dry_run:
-        print(f"  {yellow('[dry-run] Command not executed.')}")
-        return 0
-
-    print()
-    result = subprocess.run(cmd)
-    return result.returncode
+def run_uninstall(pkg: MergedResult, backend: str,
+                  dry_run: bool = False, yes: bool = False) -> int:
+    """Run the uninstall command for a single package."""
+    pkg_id   = pkg.pkg_id(backend)
+    template = UNINSTALL_COMMANDS.get(backend)
+    if not template:
+        print(f"  [smpt] No uninstall command defined for {backend}.")
+        return 1
+    cmd = [part.replace("{id}", pkg_id) for part in template]
+    if yes:
+        cmd.extend(YES_FLAGS.get(backend, []))
+    return _run_pkg_command(cmd, dry_run)
 
 
 def run_batch(resolved: list[ResolvedPackage],
@@ -967,8 +1272,6 @@ def run_batch(resolved: list[ResolvedPackage],
     Group resolved packages by backend, build one command per backend,
     print the full plan, confirm with the user, then execute.
     """
-    from collections import defaultdict
-
     # Group by backend, preserving priority order
     groups: dict[str, list[ResolvedPackage]] = defaultdict(list)
     for r in resolved:
@@ -1054,12 +1357,13 @@ def _read_key() -> str:
         ch = sys.stdin.read(1)
         if ch == "\x1b":              # escape sequence — read 2 more bytes
             ch2 = sys.stdin.read(1)
-            ch3 = sys.stdin.read(1)
             if ch2 == "[":
+                ch3 = sys.stdin.read(1)
                 if ch3 == "A": return "up"
                 if ch3 == "B": return "down"
                 if ch3 == "C": return "right"
                 if ch3 == "D": return "left"
+            return "quit"   # plain ESC
         if ch in ("\r", "\n"):       return "enter"
         if ch in ("q", "Q", "\x03"): return "quit"   # q or Ctrl-C
         return ch
@@ -1067,12 +1371,17 @@ def _read_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def _term_cols() -> int:
-    """Return terminal width, defaulting to 100 if unavailable."""
+def _term_size() -> tuple[int, int]:
+    """Return (columns, lines), defaulting to (100, 24) if unavailable."""
     try:
-        return os.get_terminal_size().columns
+        sz = os.get_terminal_size()
+        return sz.columns, sz.lines
     except OSError:
-        return 100
+        return 100, 24
+
+
+def _term_cols() -> int:
+    return _term_size()[0]
 
 
 def _format_row(pkg: MergedResult, i: int, cursor: int) -> str:
@@ -1095,7 +1404,9 @@ def _format_row(pkg: MergedResult, i: int, cursor: int) -> str:
     name_width = min(30, remaining // 2)
     desc_width = max(10, remaining - name_width - 2)
 
-    plain_name = pkg.name[:name_width]
+    mark = '✓' if pkg.is_installed else ''
+    plain_name = f"{mark} {pkg.name}" if mark else pkg.name
+    plain_name = plain_name[:name_width]
     name       = cyan(f"{plain_name:<{name_width}}")
     version    = dim(f"{pkg.version:<18}") if pkg.version else f"{'':<18}"
     source     = yellow(f"{pkg.source_tag():<12}")
@@ -1106,11 +1417,7 @@ def _format_row(pkg: MergedResult, i: int, cursor: int) -> str:
 
 
 def _term_rows() -> int:
-    """Return terminal height, defaulting to 24 if unavailable."""
-    try:
-        return os.get_terminal_size().lines
-    except OSError:
-        return 24
+    return _term_size()[1]
 
 
 # Lines consumed by header (blank+header+separator) and footer (blank+hint).
@@ -1151,7 +1458,7 @@ def _draw_window(merged: list[MergedResult], cursor: int,
     # Scroll indicators in the hint line
     up_ind   = "▲ " if scroll_top > 0          else "  "
     down_ind = " ▼" if scroll_top + win_size < n else "  "
-    print(f"\n  {dim(up_ind + '↑↓ · Enter · Q to quit' + down_ind)}")
+    print(f"\n  {dim(up_ind + '↑↓ · Enter · Q to quit · (✓) Indicates already installed' + down_ind)}")
     lines_printed += 3   # \n blank line + hint line + print()'s trailing newline
 
     return lines_printed
@@ -1215,13 +1522,19 @@ def prompt_selection(merged: list[MergedResult],
     Shows a window of items that fits the terminal height; scrolls as needed.
     Falls back to plain input() if stdin is not a real terminal.
     """
+    # Skip selection if only one option
+    if len(merged) == 1:
+        return merged[0]
+
     if not sys.stdin.isatty():
         try:
             raw = input(f"Select [1-{len(merged)}] (default: {default+1}, q to quit): ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
-        if raw.lower() in ("q", "quit", "") or raw == "":
+        if raw == "":
             return merged[default]
+        if raw.lower() in ("q", "quit"):
+            return None
         try:
             choice = int(raw)
             if 1 <= choice <= len(merged):
@@ -1295,42 +1608,6 @@ def prompt_selection(merged: list[MergedResult],
 
 
 
-def prompt_backend(result: MergedResult, action: str = "use") -> str | None:
-    """
-    If a result comes from multiple backends, ask the user which one to use.
-    `action` is shown in the prompt (e.g. "install", "get info for").
-    Returns the chosen backend name, or None if cancelled.
-    """
-    if len(result.backends) == 1:
-        return result.backends[0]
-
-    print(f"\n  '{result.name}' is available from multiple sources.")
-    print(f"  Which would you like to {action}?")
-    for i, backend in enumerate(result.backends):
-        marker = bold(f"[{i + 1}]") if i > 0 else bold("[1]")
-        default = dim("  (default)") if i == 0 else ""
-        print(f"    {marker}  {backend}{default}")
-
-    while True:
-        try:
-            raw = input(f"  Choose [1-{len(result.backends)}] (default: 1): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-
-        if raw == "":
-            return result.backends[0]
-
-        try:
-            choice = int(raw)
-            if 1 <= choice <= len(result.backends):
-                return result.backends[choice - 1]
-        except ValueError:
-            pass
-
-        print("  Invalid input.")
-
-
 def wrap(text: str, width: int = 66, indent: str = "  ") -> str:
     """Word-wrap text to width, returning an indented multiline string."""
     lines = []
@@ -1368,10 +1645,10 @@ _DETAIL_OPTIONS = [
 ]
 
 
-def _render_detail_menu(cursor: int) -> str:
+def _render_detail_menu(options: list, cursor: int) -> str:
     """Return the menu bar string (without newline) for the given cursor."""
     parts = []
-    for i, (label, hotkey, _) in enumerate(_DETAIL_OPTIONS):
+    for i, (label, hotkey, _) in enumerate(options):
         hi = label.index(next(c for c in label if c.lower() == hotkey))
         decorated = label[:hi] + bold(label[hi]) + label[hi+1:]
         if i == cursor:
@@ -1381,14 +1658,14 @@ def _render_detail_menu(cursor: int) -> str:
     return "  " + "  ".join(parts)
 
 
-def _draw_detail_menu(cursor: int) -> None:
+def _draw_detail_menu(options: list, cursor: int) -> None:
     """Print the full menu bar + hint line (initial draw only)."""
-    print(_render_detail_menu(cursor))
+    print(_render_detail_menu(options, cursor))
     print()
-    print(f"  {dim('←→ to move · Enter to select · or press hotkey')}")
+    print(f"  {dim('←→ to move · Enter to select · or press hotkey · (✓) Indicates already installed')}")
 
 
-def _update_detail_menu(cursor: int) -> None:
+def _update_detail_menu(options: list, cursor: int) -> None:
     """
     Repaint only the menu bar line in-place — no flicker.
     After _draw_detail_menu, print() has advanced past the hint line,
@@ -1401,18 +1678,22 @@ def _update_detail_menu(cursor: int) -> None:
     out = sys.stdout
     out.write("\x1b[3A")          # move up 3 lines to the menu bar
     out.write("\r\x1b[2K")        # go to start of line, clear it
-    out.write(_render_detail_menu(cursor))
+    out.write(_render_detail_menu(options, cursor))
     out.write("\x1b[3B\r")        # move back down 3 lines
     out.flush()
 
 
 def prompt_backend_arrow(result: MergedResult, action: str = "use",
-                          default: str | None = None) -> str | None:
+                          default: str | None = None,
+                          installed: list[PackageResult] | None = None) -> str | None:
     """
     Arrow-key driven backend picker for multi-source packages.
     default: backend name to pre-select (defaults to first in list).
     Falls back to plain input if stdin is not a tty.
     """
+    if installed is None:
+        installed = []
+
     if len(result.backends) == 1:
         return result.backends[0]
 
@@ -1428,7 +1709,9 @@ def prompt_backend_arrow(result: MergedResult, action: str = "use",
     if not sys.stdin.isatty():
         for i, b in enumerate(options):
             tag = dim("  (default)") if i == default_idx else ""
-            print(f"    [{i+1}]  {b}{tag}")
+            is_installed_from_this = any(inst.backend == b and inst.name.lower() == result.name.lower() for inst in installed)
+            mark = '✓ ' if is_installed_from_this else ''
+            print(f"    [{i+1}]  {mark}{b}{tag}")
         try:
             raw = input(f"  Choose [1-{n}] (default: {default_idx+1}): ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -1450,8 +1733,10 @@ def prompt_backend_arrow(result: MergedResult, action: str = "use",
         for i, b in enumerate(options):
             arrow = bold("▶") if i == cur else " "
             tag   = dim("(default)") if i == default_idx else ""
-            print(f"  {arrow}  {b}  {tag}")
-        print(f"\n  {dim('↑↓ · Enter · Q to cancel')}")
+            is_installed_from_this = any(inst.backend == b and inst.name.lower() == result.name.lower() for inst in installed)
+            mark = '✓ ' if is_installed_from_this else ''
+            print(f"  {arrow}  {mark}{b}  {tag}")
+        print(f"\n  {dim('↑↓ · Enter · Q to cancel · (✓) Indicates already installed')}")
 
     draw(cursor)
 
@@ -1495,9 +1780,26 @@ def detail_menu(pkg: MergedResult, backend: str, config: configparser.ConfigPars
     MENU_LINES = 3   # _draw_detail_menu prints: menu bar + hint line + blank
 
     use_arrow = sys.stdin.isatty()
+
+    # Define options based on installation status
+    if pkg.is_installed:
+        options = [
+            ("Back",    "b", "back"),
+            ("iNfo",    "n", "info"),
+            ("Uninstall", "u", "uninstall"),
+            ("Quit",    "q", "quit"),
+        ]
+    else:
+        options = [
+            ("Back",    "b", "back"),
+            ("iNfo",    "n", "info"),
+            ("Install", "i", "install"),
+            ("Quit",    "q", "quit"),
+        ]
+
     # Find cursor start position from default_action hotkey
     cursor = next(
-        (i for i, (_, hk, _) in enumerate(_DETAIL_OPTIONS) if hk == default_action),
+        (i for i, (_, hk, _) in enumerate(options) if hk == default_action),
         0
     )
 
@@ -1505,13 +1807,15 @@ def detail_menu(pkg: MergedResult, backend: str, config: configparser.ConfigPars
     print_detail(pkg, backend)
 
     if not use_arrow:
-        print("  [B]ack  i[N]fo  [I]nstall  [Q]uit\n")
+        action = "Uninstall" if pkg.is_installed else "Install"
+        action_hotkey = "u" if pkg.is_installed else "i"
+        print(f"  [B]ack  i[N]fo  [{action[0]}]{action[1:]}  [Q]uit\n")
         try:
             key = input("  Choice (default: B): ").strip().lower() or "b"
         except (EOFError, KeyboardInterrupt):
             key = "q"
     else:
-        _draw_detail_menu(cursor)
+        _draw_detail_menu(options, cursor)
         key = None   # enter the navigation loop below
 
     while True:
@@ -1523,14 +1827,14 @@ def detail_menu(pkg: MergedResult, backend: str, config: configparser.ConfigPars
         # Left / Right: move cursor — repaint only the menu bar, no flicker
         if use_arrow and key in ("left", "right"):
             step = -1 if key == "left" else 1
-            cursor = (cursor + step) % len(_DETAIL_OPTIONS)
-            _update_detail_menu(cursor)
+            cursor = (cursor + step) % len(options)
+            _update_detail_menu(options, cursor)
             key = None
             continue
 
         # Enter: resolve to the hotkey of the highlighted option
         if use_arrow and key == "enter":
-            key = _DETAIL_OPTIONS[cursor][1]
+            key = options[cursor][1]
 
         # ── Actions ───────────────────────────────────────────────────────
         if key in ("b", "back", ""):
@@ -1542,10 +1846,11 @@ def detail_menu(pkg: MergedResult, backend: str, config: configparser.ConfigPars
             run_info(pkg, backend)
             print_detail(pkg, backend)
             if use_arrow:
-                _draw_detail_menu(cursor)
+                _draw_detail_menu(options, cursor)
                 key = None
             else:
-                print("  [B]ack  i[N]fo  [I]nstall  [Q]uit\n")
+                action = "Uninstall" if pkg.is_installed else "Install"
+                print(f"  [B]ack  i[N]fo  [{action[0]}]{action[1:]}  [Q]uit\n")
                 try:
                     key = input("  Choice (default: B): ").strip().lower() or "b"
                 except (EOFError, KeyboardInterrupt):
@@ -1563,12 +1868,12 @@ def detail_menu(pkg: MergedResult, backend: str, config: configparser.ConfigPars
                 except (EOFError, KeyboardInterrupt):
                     print()
                     if use_arrow:
-                        _draw_detail_menu(cursor)
+                        _draw_detail_menu(options, cursor)
                         key = None
                     continue
                 if confirm not in ("y", "yes"):
                     if use_arrow:
-                        _draw_detail_menu(cursor)
+                        _draw_detail_menu(options, cursor)
                         key = None
                     continue
 
@@ -1577,6 +1882,15 @@ def detail_menu(pkg: MergedResult, backend: str, config: configparser.ConfigPars
                 print(f"\n  {bold(pkg.name)} installed successfully via {yellow(backend)}.\n")
             else:
                 print(f"\n  {yellow('Warning:')} install exited with code {rc}.\n")
+            return False
+
+        elif key in ("u", "uninstall"):
+            _erase_lines(MENU_LINES)
+            rc = run_uninstall(pkg, backend, dry_run=dry_run, yes=yes)
+            if rc == 0:
+                print(f"\n  {bold(pkg.name)} uninstalled successfully via {yellow(backend)}.\n")
+            else:
+                print(f"\n  {yellow('Warning:')} uninstall exited with code {rc}.\n")
             return False
 
         elif key in ("q", "quit", "exit", "\x03"):
@@ -1590,6 +1904,35 @@ def detail_menu(pkg: MergedResult, backend: str, config: configparser.ConfigPars
 # ---------------------------------------------------------------------------
 # Command: search
 # ---------------------------------------------------------------------------
+
+
+def _run_selection_loop(merged: list[MergedResult],
+                        installed: list[PackageResult],
+                        config: configparser.ConfigParser,
+                        dry_run: bool = False,
+                        yes: bool = False) -> None:
+    """
+    Shared interactive loop used by cmd_search and cmd_info.
+    Shows the package list, lets the user pick a package and backend,
+    then hands off to detail_menu. Loops until the user quits or installs.
+    """
+    while True:
+        chosen_pkg = prompt_selection(merged)
+        if chosen_pkg is None:
+            print("Cancelled.")
+            return
+
+        chosen_backend = prompt_backend_arrow(chosen_pkg,
+                                              action="view details for",
+                                              installed=installed)
+        if chosen_backend is None:
+            continue
+
+        go_back = detail_menu(chosen_pkg, chosen_backend, config,
+                              dry_run=dry_run, yes=yes)
+        if not go_back:
+            return
+
 
 def cmd_search(query: str, config: configparser.ConfigParser,
                dry_run: bool = False, yes: bool = False,
@@ -1606,72 +1949,59 @@ def cmd_search(query: str, config: configparser.ConfigParser,
     # Queries with spaces are treated as phrase searches — disable name filter.
     name_filter = False if (search_desc or " " in query) else config.getboolean("smpt", "name_filter", fallback=True)
 
-    all_results: list[PackageResult] = []
-    for backend in backends:
-        fn = SEARCH_FUNCTIONS.get(backend)
-        if fn:
-            found = fn(query)
-            # Apply name filter per-backend so the count shown to the user
-            # reflects results that will actually appear, not raw backend output
-            if name_filter and query:
-                q = query.lower()
-                found = [p for p in found if p.matches_query(q)]
-            print(f"  {backend}: {len(found)} result(s)")
-            all_results.extend(found)
+    all_results = parallel_search_backends(query, backends, name_filter)
 
     # name_filter already applied above, pass False to avoid double-filtering
     merged = merge_results(all_results, query=query, name_filter=False)
 
+    installed = check_installed(query, backends)
+    installed_names = {p.name.lower() for p in installed}
+    for m in merged:
+        m.is_installed = m.name.lower() in installed_names
+
     if not merged:
-        # Remote search returned nothing — check if already installed
-        installed = check_installed(query, backends)
-        if installed:
-            print(f"\n  {yellow('Note:')} No new packages found, but '{query}' is already installed:")
-            for pkg in installed:
-                print(f"    {cyan(pkg.name):<38} {dim(pkg.version):<18} via {yellow(pkg.backend)}")
-            print()
-            try:
-                ans = input("  Install from another source anyway? [y/N]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
-            if ans not in ("y", "yes"):
-                print("Cancelled.")
-                return
-            print(f"\n[smpt] Re-searching without name filter...")
-            merged = merge_results(all_results, query=query, name_filter=False)
-        if not merged:
-            print(f"\nNo packages found matching '{query}'.")
-            return
+        print(f"\nNo packages found matching '{query}'.")
+        return
 
-    # Note any already-installed matches before showing the table
-    else:
-        installed = check_installed(query, backends)
-        if installed:
-            print()
-            for pkg in installed:
-                print(f"  {yellow("⬤")} Already installed: {cyan(pkg.name)} {dim(pkg.version)} via {yellow(pkg.backend)}")
+    _run_selection_loop(merged, installed, config, dry_run=dry_run, yes=yes)
 
-    # Main results loop — stays here until user installs or quits
-    while True:
-        # prompt_selection draws the results table itself (arrow-key UI)
-        chosen_pkg = prompt_selection(merged)
-        if chosen_pkg is None:
-            print("Cancelled.")
-            return
 
-        # Resolve backend before showing detail — single-source skips the prompt
-        chosen_backend = prompt_backend_arrow(chosen_pkg, action="view details for")
-        if chosen_backend is None:
-            # User cancelled the backend picker — go back to results
-            continue
+def cmd_info(query: str, config: configparser.ConfigParser,
+             dry_run: bool = False, yes: bool = False,
+             search_desc: bool = False) -> None:
+    backends = get_enabled_backends(config)
 
-        # Show detail view scoped to the chosen backend
-        # Returns True = back to results, False = exit
-        go_back = detail_menu(chosen_pkg, chosen_backend, config,
-                              dry_run=dry_run, yes=yes)
-        if not go_back:
-            return
+    if not backends:
+        print("[smpt] No package backends are available on this system.")
+        sys.exit(1)
+
+    print(f"[smpt] Searching installed packages for '{query}' across: {', '.join(backends)}")
+
+    # --description overrides the config name_filter for this run.
+    # Queries with spaces are treated as phrase searches — disable name filter.
+    name_filter = False if (search_desc or " " in query) else config.getboolean("smpt", "name_filter", fallback=True)
+
+    # Get all installed packages
+    installed = check_installed(query, backends)
+    print(f"  Found {len(installed)} installed package(s)")
+
+    # Apply name filter
+    if name_filter and query:
+        q = query.lower()
+        installed = [p for p in installed if p.matches_query(q)]
+
+    # Merge results
+    merged = merge_results(installed, query=query, name_filter=False)
+
+    # All are installed
+    for m in merged:
+        m.is_installed = True
+
+    if not merged:
+        print(f"\nNo installed packages found matching '{query}'.")
+        return
+
+    _run_selection_loop(merged, installed, config, dry_run=dry_run, yes=yes)
 
 
 def resolve_one(query: str, backends: list[str], config: configparser.ConfigParser,
@@ -1689,18 +2019,14 @@ def resolve_one(query: str, backends: list[str], config: configparser.ConfigPars
         else config.getboolean("smpt", "name_filter", fallback=True)
     )
 
-    all_results: list[PackageResult] = []
-    for backend in backends:
-        fn = SEARCH_FUNCTIONS.get(backend)
-        if fn:
-            found = fn(query)
-            if name_filter and query:
-                q = query.lower()
-                found = [p for p in found if p.matches_query(q)]
-            print(f"  {backend}: {len(found)} result(s)")
-            all_results.extend(found)
+    all_results = parallel_search_backends(query, backends, name_filter)
 
     merged = merge_results(all_results, query=query, name_filter=False)
+
+    installed = check_installed(query, backends)
+    installed_names = {p.name.lower() for p in installed}
+    for m in merged:
+        m.is_installed = m.name.lower() in installed_names
 
     if not merged:
         print(f"  {yellow('No packages found matching')} '{query}'. Skipping.")
@@ -1712,6 +2038,14 @@ def resolve_one(query: str, backends: list[str], config: configparser.ConfigPars
 
     # ── -y mode ───────────────────────────────────────────────────────────
     if yes:
+        # Filter out installed for -y mode
+        merged = [m for m in merged if not m.is_installed]
+        if not merged:
+            print(f"[smpt] '{query}' is already installed.")
+            return None
+        exact_idx = next(
+            (i for i, pkg in enumerate(merged) if is_exact_match(pkg, query)), None
+        )
         if exact_idx is None:
             print(f"  {yellow('No exact match for')} '{query}'. Skipping "
                   f"(run without -y to choose interactively).")
@@ -1721,13 +2055,6 @@ def resolve_one(query: str, backends: list[str], config: configparser.ConfigPars
         return ResolvedPackage(query=query, pkg=pkg, backend=backend)
 
     # ── Interactive mode ───────────────────────────────────────────────────
-    installed = check_installed(query, backends)
-    if installed:
-        print()
-        for p in installed:
-            print(f"  {yellow('⬤')} Already installed: "
-                  f"{cyan(p.name)} {dim(p.version)} via {yellow(p.backend)}")
-
     while True:
         chosen_pkg = prompt_selection(merged, default=exact_idx or 0)
         if chosen_pkg is None:
@@ -1738,7 +2065,7 @@ def resolve_one(query: str, backends: list[str], config: configparser.ConfigPars
             chosen_pkg.backends[0]
         )
         chosen_backend = prompt_backend_arrow(
-            chosen_pkg, action="install from", default=best_backend,
+            chosen_pkg, action="install from", default=best_backend, installed=installed
         )
         if chosen_backend is None:
             continue
@@ -1779,30 +2106,17 @@ def cmd_install(query: str, config: configparser.ConfigParser,
     else:
         queries = query.split()
 
-    # ── Already-installed check for -y multi-package ──────────────────────
-    if yes and len(queries) > 1:
-        installed_names: set[str] = set()
-        for q in queries:
-            found = check_installed(q, backends)
-            if any(is_exact_match(
-                MergedResult(p.name, p.version, p.description, [p.backend]), q
-            ) for p in found):
-                print(f"[smpt] '{q}' is already installed. Skipping.")
-                installed_names.add(q)
-        queries = [q for q in queries if q not in installed_names]
-        if not queries:
-            return
-
     # ── Resolve each package ──────────────────────────────────────────────
-    # Multi-package installs always auto-select the best exact match (like -y)
-    # so the user isn't walked through a separate UI for every package.
-    # The confirmation step in run_batch is where they get to review and approve.
+    # Multi-package installs always auto-select the best exact match (like -y).
+    # The confirmation step in run_batch is where the user reviews and approves.
     auto = yes or len(queries) > 1
 
     resolved: list[ResolvedPackage] = []
     for q in queries:
-        # Skip if already installed from any source (multi-package only)
-        if len(queries) > 1:
+        # In multi-package or -y mode, skip packages already installed
+        # from any source. Single interactive installs always proceed so the
+        # user can still reinstall or switch sources.
+        if len(queries) > 1 or yes:
             already = check_installed(q, backends)
             exact_installed = [p for p in already if q.lower() in p.name.lower()]
             if exact_installed:
@@ -1834,76 +2148,6 @@ def cmd_install(query: str, config: configparser.ConfigParser,
 # ---------------------------------------------------------------------------
 
 
-def get_deploy_path() -> Path:
-    """Return the appropriate user bin path for the current OS."""
-    if sys.platform == "win32":
-        # Windows: use %USERPROFILE%\bin, creating it if needed
-        return Path.home() / "bin"
-    else:
-        # Linux and macOS: ~/.local/bin is the XDG standard user bin
-        return Path(os.environ.get("HOME", str(Path.home()))) / ".local" / "bin"
-
-
-def cmd_deploy() -> None:
-    """
-    Copy this script to the user's bin directory as 'smpt' and mark it
-    executable, so it can be run from anywhere as just 'smpt'.
-    """
-    src = Path(os.path.abspath(__file__))
-    bin_dir = get_deploy_path()
-
-    if sys.platform == "win32":
-        dst = bin_dir / "smpt.py"
-    else:
-        dst = bin_dir / "smpt"
-
-    # Create the bin directory if it doesn't exist
-    try:
-        bin_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        print(f"[smpt] Could not create {bin_dir}: {e}")
-        sys.exit(1)
-
-    # Copy the script
-    try:
-        import shutil
-        shutil.copy2(src, dst)
-    except OSError as e:
-        print(f"[smpt] Could not copy to {dst}: {e}")
-        sys.exit(1)
-
-    # Mark executable on non-Windows
-    if sys.platform != "win32":
-        try:
-            dst.chmod(dst.stat().st_mode | 0o755)
-        except OSError as e:
-            print(f"[smpt] Copied but could not mark executable: {e}")
-            sys.exit(1)
-
-    print(f"[smpt] Deployed to {bold(str(dst))}")
-
-    # Check if the bin directory is on $PATH and warn if not
-    if sys.platform != "win32":
-        path_dirs = os.environ.get("PATH", "").split(":")
-        if str(bin_dir) not in path_dirs:
-            print()
-            print(f"  {yellow('Note:')} {bin_dir} is not on your $PATH.")
-            print(f"  Add this to your shell config (~/.bashrc, ~/.zshrc, etc.):")
-            print()
-            print(f"    {cyan(f'export PATH="$HOME/.local/bin:$PATH"')}")
-            print()
-            print(f"  Then restart your shell or run:")
-            print(f"    {cyan('source ~/.bashrc')}")
-    else:
-        path_dirs = os.environ.get("PATH", "").split(";")
-        if str(bin_dir) not in path_dirs:
-            print()
-            print(f"  {yellow('Note:')} {bin_dir} is not on your PATH.")
-            print(f"  Add it via System Properties → Environment Variables.")
-            print(f"  Also ensure .py files are associated with Python.")
-
-
-
 def cmd_deploy() -> None:
     """
     Copy this script to the user's local bin directory and mark it executable,
@@ -1912,9 +2156,6 @@ def cmd_deploy() -> None:
     Also copies a local config.ini if one sits next to the script, placing it
     in the OS config directory so it is picked up on future runs.
     """
-    import shutil
-    import stat
-
     src = Path(os.path.abspath(__file__))
 
     # ── Determine destination directory ───────────────────────────────────
@@ -2020,12 +2261,11 @@ def print_help() -> None:
 
 {bold("Commands:")}
   {cyan("search")}   <package>   Search for a package across all active backends
+  {cyan("info")}     <package>   Search for installed packages matching <package>
   {cyan("install")}  <package> [package2 ...]   Install one or more packages  (alias: {dim("in")})
   {cyan("deploy")}               Copy smpt to ~/.local/bin and mark it executable,
                         so it can be called as just {bold("smpt")} from anywhere.
   {cyan("help")}                 Show this help text  (alias: {dim("-h")}, {dim("--help")})
-  {cyan("deploy")}               Copy smpt to ~/.local/bin/smpt and mark executable,
-                        so it can be run from anywhere as just {dim("smpt")}
 
 {bold("Flags:")} (work with both search and install)
   {cyan("--dry-run")}            Print the install command without running it
@@ -2053,7 +2293,7 @@ def print_help() -> None:
 {bold("Detail menu:")}
   {cyan("B")}  Back to results
   {cyan("N")}  iNfo — run the backend's info command for more details
-  {cyan("I")}  Install the package
+  {cyan("I")}  Install the package  (or {cyan("U")} Uninstall if already installed)
   {cyan("Q")}  Quit
 
 {bold("Config file:")}
@@ -2061,7 +2301,7 @@ def print_help() -> None:
   Edit to enable/disable backends or change their priority order.
 
 {bold("Supported backends:")}
-  flatpak · appman · brew · cargo · apt · dnf · pacman · rpm-ostree
+  flatpak · appman · brew · cargo · conda · apt · dnf · pacman · rpm-ostree
   (only backends detected on your system are used)
 """)
 
@@ -2125,16 +2365,19 @@ def main():
         cmd_deploy()
         return
 
-    if command == "deploy":
-        cmd_deploy()
-        return
-
     if command == "search":
         if not args:
             print("Usage: smpt search [--dry-run] [-y] <package name>")
             sys.exit(1)
         query = " ".join(args)
         cmd_search(query, config, dry_run=dry_run, yes=yes, search_desc=search_desc)
+
+    elif command == "info":
+        if not args:
+            print("Usage: smpt info [--dry-run] [-y] <package name>")
+            sys.exit(1)
+        query = " ".join(args)
+        cmd_info(query, config, dry_run=dry_run, yes=yes, search_desc=search_desc)
 
     elif command in ("install", "in"):
         if not args:
